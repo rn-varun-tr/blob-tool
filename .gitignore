@@ -1,0 +1,7 @@
+.env
+responses/
+output.xlsx
+__pycache__/
+*.pyc
+.venv/
+venv/
