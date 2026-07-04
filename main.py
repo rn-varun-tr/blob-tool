@@ -66,8 +66,10 @@ class Config:
     service_functions_key: Optional[str]
     detection_model: str
     output_dir: str = "response"
-    allowed_extensions: tuple = ("png", "pdf")
-    process_extensionless: bool = True
+    allowed_extensions: tuple = (
+        "pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp", "heic", "heif",
+    )
+    process_extensionless: bool = False
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -89,10 +91,13 @@ class Config:
             output_dir=os.getenv("OUTPUT_DIR", "response"),
             allowed_extensions=tuple(
                 e.strip().lstrip(".").lower()
-                for e in os.getenv("ALLOWED_EXTENSIONS", "png,pdf").split(",")
+                for e in os.getenv(
+                    "ALLOWED_EXTENSIONS",
+                    "pdf,png,jpg,jpeg,tif,tiff,bmp,gif,webp,heic,heif",
+                ).split(",")
                 if e.strip()
             ),
-            process_extensionless=os.getenv("PROCESS_EXTENSIONLESS", "true").strip().lower()
+            process_extensionless=os.getenv("PROCESS_EXTENSIONLESS", "false").strip().lower()
             in ("1", "true", "yes", "y"),
         )
 

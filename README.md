@@ -119,13 +119,12 @@ az login --identity --username 7458e3e2-adbf-4703-9fde-f477693018f7
 columns are used only as a fallback. A leading-slash path like `/Source/Container/folder/file.pdf`
 and a full `https://...` URL both work.
 
-**Only `png` and `pdf` blobs are processed** by default — other types (`.msi`, `.zip`, …) are
-skipped and marked `skipped` in the summary. Change this with `ALLOWED_EXTENSIONS` in `.env`
-(comma-separated, e.g. `ALLOWED_EXTENSIONS=png,pdf,tiff`).
+**Only PDF and image blobs are processed** — `pdf, png, jpg, jpeg, tif, tiff, bmp, gif, webp,
+heic, heif`. Everything else (`.msi`, `.zip`, …) is skipped and marked `skipped` in the summary.
+Change the list with `ALLOWED_EXTENSIONS` in `.env` (comma-separated).
 
-**Extensionless blobs are also attempted** (they're often just missing an extension). Tika
-auto-detects the real type from the bytes; if it can't parse the file, that row is marked
-`error` and the tool moves on. Turn this off with `PROCESS_EXTENSIONLESS=false`.
+**Extensionless blobs are skipped** by default. If you want the tool to also try them (Tika
+auto-detects the real type; unparseable files are then skipped), set `PROCESS_EXTENSIONLESS=true`.
 
 ## Run options
 
