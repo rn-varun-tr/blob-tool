@@ -10,12 +10,13 @@ Small Python tool that, for each row in an Excel file:
 
 ## Authentication (important)
 
-On the VM the tool authenticates with a **user-assigned Managed Identity** — no keys, no `az login`.
+On the VM the tool authenticates with a **Managed Identity** — no keys, no `az login`.
 
 | Setting | Value |
 |---|---|
-| MI name | **Abyss-04** |
-| MI client id | `9e11a244-d9b5-44a3-8234-07d2141b3f69` (set as `MANAGED_IDENTITY_CLIENT_ID`) |
+| VM name | **Abyss-04** (its **system-assigned** identity is used) |
+| Client id | `7458e3e2-adbf-4703-9fde-f477693018f7` (set as `MANAGED_IDENTITY_CLIENT_ID`) |
+| Object id | `9e11a244-d9b5-44a3-8234-07d2141b3f69` (the "MI Id" originally provided — used for RBAC) |
 
 | Service | Auth used | Role the MI needs |
 |---|---|---|
@@ -24,20 +25,18 @@ On the VM the tool authenticates with a **user-assigned Managed Identity** — n
 | GuardPII `recognize` | `x-functions-key` header (secret in `.env`) | — |
 
 > **Prerequisites on the VM (one-time):**
-> 1. The managed identity **Abyss-04** must be **assigned to the VM** (VM → Identity → User assigned).
-> 2. **Abyss-04** must have the **Storage Blob Data Reader** role on the storage account/container.
+> 1. The VM **Abyss-04** has a **system-assigned** managed identity enabled (it does).
+> 2. That identity must have the **Storage Blob Data Reader** role on the storage account/container.
 >    Management-plane "Reader"/"Owner" does **not** grant blob *data* access.
 >
-> ⚠️ **"Identity not found" / ManagedIdentityCredential unavailable?** The value `9e11a244-...`
-> was given only as "MI Id", and the code uses it as the **client id**. A managed identity has
-> *two* different GUIDs — a **Client ID** (for auth) and an **Object/Principal ID** (for roles).
-> If you get `Identity not found`, either:
-> - the identity isn't attached to this VM (Portal > VM > Identity > **User assigned**), or
-> - `9e11a244-...` is the **object id**, not the client id.
+> ℹ️ **About the two GUIDs:** a managed identity has a **Client ID** (`7458e3e2-...`, used for auth)
+> and an **Object/Principal ID** (`9e11a244-...`, used for role assignments). The `9e11a244-...`
+> value originally provided as "MI Id" is the **object id**, which is why using it as a client id
+> failed with `Identity not found`. The tool is now configured with the correct client id.
 >
-> Fixes: put the real Client ID (Portal > Managed Identities > Abyss-04 > **Client ID**) in
-> `MANAGED_IDENTITY_CLIENT_ID`; **or** set `MANAGED_IDENTITY_OBJECT_ID` (and clear the client id);
-> **or** set `MANAGED_IDENTITY_RESOURCE_ID` to the identity's full ARM resource id.
+> If auth ever fails, alternatives in `.env`: clear `MANAGED_IDENTITY_CLIENT_ID` and set
+> `MANAGED_IDENTITY_OBJECT_ID=9e11a244-...`, **or** leave all MI ids empty to use the VM's
+> default (system-assigned) identity.
 
 ### Local testing (optional)
 
@@ -90,16 +89,17 @@ python main.py --limit 3      # test on 3 rows first
 python main.py                # then the full run
 ```
 
-> No `az login` is needed on the VM — the Managed Identity **Abyss-04** is used automatically.
-> The log line `Auth: user-assigned Managed Identity (client_id=9e11a244-...)` confirms it's active.
+> No `az login` is needed on the VM — the managed identity of **Abyss-04** is used automatically.
+> The log line `Auth: user-assigned Managed Identity (client_id=7458e3e2-...)` confirms it's active,
+> followed by `Auth OK.` once a token is obtained.
 
 ### Verify the identity works (optional)
 
 ```bash
 # lists blobs using the VM's managed identity
 az storage blob list --account-name <acct> --container-name <container> \
-  --auth-mode login --login-experience-v2 false 2>/dev/null || \
-az login --identity --username 9e11a244-d9b5-44a3-8234-07d2141b3f69
+  --auth-mode login 2>/dev/null || \
+az login --identity --username 7458e3e2-adbf-4703-9fde-f477693018f7
 ```
 
 ## Input file (CSV or Excel)
