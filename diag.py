@@ -20,6 +20,7 @@ Usage (PowerShell, all one line). Defaults to the blob you want to check:
 from __future__ import annotations
 
 import os
+import re
 import sys
 from urllib.parse import quote
 
@@ -46,6 +47,55 @@ def get_token(client_id: str | None) -> str:
     resp = requests.get(IMDS_URL, headers={"Metadata": "true"}, params=params, timeout=30)
     resp.raise_for_status()
     return resp.json()["access_token"]
+
+
+def _names(xml_text: str, tag: str = "Name") -> list[str]:
+    return re.findall(rf"<{tag}>(.*?)</{tag}>", xml_text or "", flags=re.DOTALL)
+
+
+def _auth_headers(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}", "x-ms-version": "2021-08-06"}
+
+
+def list_containers(account: str, token: str) -> None:
+    """List the containers that actually exist on the account."""
+    url = f"https://{account}.blob.core.windows.net/?comp=list"
+    resp = requests.get(url, headers=_auth_headers(token), timeout=60)
+    print(f"\n3) List containers on '{account}': HTTP {resp.status_code}")
+    if resp.status_code == 200:
+        names = _names(resp.text)
+        if names:
+            print("   Containers that exist on this account:")
+            for n in names:
+                print(f"     - {n}")
+        else:
+            print("   (account has no containers, or none visible to this identity)")
+    else:
+        print("   " + (resp.text or "(empty)")[:600].replace("\n", "\n   "))
+        if resp.status_code == 403:
+            print("   (this identity can read blobs but not LIST containers -- needs account-scope read)")
+
+
+def list_blobs(account: str, container: str, token: str, prefix: str = "", limit: int = 25) -> None:
+    """List up to `limit` blob names in a container (optionally under a prefix)."""
+    url = (
+        f"https://{account}.blob.core.windows.net/{container}"
+        f"?restype=container&comp=list&maxresults={limit}"
+    )
+    if prefix:
+        url += f"&prefix={quote(prefix, safe='/')}"
+    resp = requests.get(url, headers=_auth_headers(token), timeout=60)
+    print(f"\n4) List blobs in '{container}' (prefix='{prefix}'): HTTP {resp.status_code}")
+    if resp.status_code == 200:
+        names = _names(resp.text)
+        if names:
+            print(f"   First {len(names)} blob name(s):")
+            for n in names:
+                print(f"     - {n}")
+        else:
+            print("   (no blobs match this prefix)")
+    else:
+        print("   " + (resp.text or "(empty)")[:600].replace("\n", "\n   "))
 
 
 def main() -> None:
@@ -91,7 +141,20 @@ def main() -> None:
                 "   'Storage Blob Data Reader' role on the account/container."
             )
         elif resp.status_code == 404:
-            print("\n=> 404: the blob path doesn't exist. Double-check container/blob name.")
+            body = resp.text or ""
+            if "ContainerNotFound" in body:
+                print(
+                    f"\n=> 404 ContainerNotFound: account '{account}' is reachable and auth works,\n"
+                    f"   but it has no container named '{container}'. Listing the REAL containers..."
+                )
+                list_containers(account, token)
+            else:
+                print(
+                    "\n=> 404 BlobNotFound: the container exists but the blob path is wrong.\n"
+                    "   Listing blobs under the leading path to help you find the right name..."
+                )
+                prefix = blob.split("/")[0] if "/" in blob else ""
+                list_blobs(account, container, token, prefix=prefix)
 
 
 if __name__ == "__main__":
