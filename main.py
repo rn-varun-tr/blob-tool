@@ -36,7 +36,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-from azure.core.exceptions import HttpResponseError, ServiceRequestError
+from azure.core.exceptions import ClientAuthenticationError, HttpResponseError, ServiceRequestError
 from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
 from azure.storage.blob import BlobServiceClient
 
@@ -46,6 +46,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("ocr-tool")
+# Quiet the very verbose Azure SDK HTTP/identity logging (IMDS token requests, etc.)
+logging.getLogger("azure").setLevel(logging.WARNING)
 
 
 # --------------------------------------------------------------------------- #
@@ -103,6 +105,10 @@ def with_retry(fn, *, attempts: int = 3, base_delay: float = 2.0):
     for i in range(attempts):
         try:
             return fn()
+        except ClientAuthenticationError:
+            # Auth / identity errors (e.g. "Identity not found") won't fix themselves --
+            # fail fast instead of burning ~14s of backoff per blob.
+            raise
         except (ServiceRequestError, HttpResponseError, requests.RequestException) as exc:
             last_exc = exc
             wait = base_delay * (2 ** i)
@@ -137,6 +143,7 @@ def build_credential():
     use_mi = os.getenv("USE_MANAGED_IDENTITY", "true").strip().lower() in ("1", "true", "yes", "y")
     client_id = os.getenv("MANAGED_IDENTITY_CLIENT_ID", "").strip() or None
     object_id = os.getenv("MANAGED_IDENTITY_OBJECT_ID", "").strip() or None
+    resource_id = os.getenv("MANAGED_IDENTITY_RESOURCE_ID", "").strip() or None
 
     if use_mi:
         if client_id:
@@ -145,6 +152,9 @@ def build_credential():
         if object_id:
             log.info("Auth: user-assigned Managed Identity (object_id=%s)", object_id)
             return ManagedIdentityCredential(identity_config={"object_id": object_id})
+        if resource_id:
+            log.info("Auth: user-assigned Managed Identity (resource_id=%s)", resource_id)
+            return ManagedIdentityCredential(identity_config={"resource_id": resource_id})
         log.info("Auth: system-assigned Managed Identity")
         return ManagedIdentityCredential()
 
@@ -160,6 +170,31 @@ def get_credential():
     if _credential is None:
         _credential = build_credential()
     return _credential
+
+
+def verify_auth() -> None:
+    """
+    Acquire a token once, up front, so authentication problems fail fast with a
+    clear, actionable message instead of erroring on every single blob.
+    """
+    log.info("Checking Azure authentication...")
+    try:
+        get_credential().get_token("https://storage.azure.com/.default")
+    except ClientAuthenticationError as exc:
+        raise SystemExit(
+            "\nAzure authentication FAILED -- could not get a token for the managed identity.\n"
+            f"  Detail: {exc}\n\n"
+            "This is an IDENTITY problem, NOT the storage account name: token acquisition\n"
+            "happens before any storage call. 'Identity not found' from IMDS means the id in\n"
+            ".env is not a user-assigned identity attached to THIS VM. Fix one of:\n"
+            "  1. Attach Abyss-04 to this VM:  Portal > this VM > Identity > 'User assigned' tab.\n"
+            "  2. Use the correct CLIENT ID:   Portal > Managed Identities > Abyss-04 > 'Client ID',\n"
+            "     then set MANAGED_IDENTITY_CLIENT_ID to it.\n"
+            "  3. If your GUID is the OBJECT (principal) id, set MANAGED_IDENTITY_OBJECT_ID instead\n"
+            "     (clear MANAGED_IDENTITY_CLIENT_ID). Or set MANAGED_IDENTITY_RESOURCE_ID to the\n"
+            "     identity's full ARM resource id.\n"
+        )
+    log.info("Auth OK.")
 
 
 def blob_service(storage_name: str) -> BlobServiceClient:
@@ -320,6 +355,8 @@ def main() -> None:
         raise SystemExit("SERVICE_ENDPOINT is not set. Copy .env.example to .env and fill it in.")
     if not cfg.service_functions_key:
         raise SystemExit("SERVICE_FUNCTIONS_KEY is not set. Add the x-functions-key to your .env.")
+
+    verify_auth()
 
     Path(cfg.output_dir).mkdir(exist_ok=True)
 

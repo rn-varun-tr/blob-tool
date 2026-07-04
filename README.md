@@ -28,9 +28,16 @@ On the VM the tool authenticates with a **user-assigned Managed Identity** — n
 > 2. **Abyss-04** must have the **Storage Blob Data Reader** role on the storage account/container.
 >    Management-plane "Reader"/"Owner" does **not** grant blob *data* access.
 >
-> ⚠️ The value `9e11a244-...` was given as "MI Id". The code uses it as the **client id**.
-> If auth fails with an identity-not-found error, it may be the **object (principal) id** instead —
-> in that case clear `MANAGED_IDENTITY_CLIENT_ID` and set `MANAGED_IDENTITY_OBJECT_ID` to that value in `.env`.
+> ⚠️ **"Identity not found" / ManagedIdentityCredential unavailable?** The value `9e11a244-...`
+> was given only as "MI Id", and the code uses it as the **client id**. A managed identity has
+> *two* different GUIDs — a **Client ID** (for auth) and an **Object/Principal ID** (for roles).
+> If you get `Identity not found`, either:
+> - the identity isn't attached to this VM (Portal > VM > Identity > **User assigned**), or
+> - `9e11a244-...` is the **object id**, not the client id.
+>
+> Fixes: put the real Client ID (Portal > Managed Identities > Abyss-04 > **Client ID**) in
+> `MANAGED_IDENTITY_CLIENT_ID`; **or** set `MANAGED_IDENTITY_OBJECT_ID` (and clear the client id);
+> **or** set `MANAGED_IDENTITY_RESOURCE_ID` to the identity's full ARM resource id.
 
 ### Local testing (optional)
 
