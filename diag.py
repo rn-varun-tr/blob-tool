@@ -12,9 +12,9 @@ plain HTTP GET on the blob. That isolates the HTTP 500 "InternalError" you're se
 
 Needs nothing beyond what's already installed (requests, python-dotenv).
 
-Usage (PowerShell, all one line). Defaults to the blob that failed for you:
+Usage (PowerShell, all one line). Defaults to the blob you want to check:
   python diag.py
-  python diag.py devssecontentstore abc "copy/Metadata.png"
+  python diag.py qassrcontentstore event-data "gtr/.../Filled Organizer.pdf"
 """
 
 from __future__ import annotations
@@ -28,10 +28,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Defaults to the row-5 blob from your run so you can just: python diag.py
-DEFAULT_ACCOUNT = "devssecontentstore"
-DEFAULT_CONTAINER = "abc"
-DEFAULT_BLOB = "copy/Metadata.png"
+# Defaults to the blob you want to check so you can just: python diag.py
+# (storage account taken from the Source column -- the leading "o" in the FullPath is ignored)
+DEFAULT_ACCOUNT = "qassrcontentstore"
+DEFAULT_CONTAINER = "event-data"
+DEFAULT_BLOB = "gtr/00f6141d-18ef-42ee-b270-482a5fa18b8b/filledorganizer/Filled Organizer.pdf"
 
 IMDS_URL = "http://169.254.169.254/metadata/identity/oauth2/token"
 STORAGE_RESOURCE = "https://storage.azure.com/"
