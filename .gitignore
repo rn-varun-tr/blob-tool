@@ -5,3 +5,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+_recognize_body.json
+sample.txt
+
+# Large source data + local test artifacts (not for GitHub)
+safesend_files*.csv
+Sample-electric-Bill-2023.pdf

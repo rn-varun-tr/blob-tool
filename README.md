@@ -4,8 +4,8 @@ Small Python tool that, for each row in an Excel file:
 
 1. Reads **storage account**, **container**, and **full blob path**.
 2. Downloads the blob from **Azure Storage**.
-3. Sends the file to a **Tika server** (`PUT /tika`) to extract text.
-4. **POSTs** the extracted text as JSON to your downstream service.
+3. Sends the file to a **Tika server** (`PUT /tika`, `Accept: text/plain`) to extract text.
+4. **POSTs** the extracted text to the **GuardPII `recognize`** endpoint for PII detection.
 5. Saves a summary Excel + one JSON file per row under `responses/`.
 
 ## Authentication (important)
@@ -21,6 +21,7 @@ On the VM the tool authenticates with a **user-assigned Managed Identity** — n
 |---|---|---|
 | Azure Storage | `ManagedIdentityCredential` (Abyss-04) | **Storage Blob Data Reader** on the account/container (data-plane) |
 | Tika server | Plain HTTP (no auth by default) | — |
+| GuardPII `recognize` | `x-functions-key` header (secret in `.env`) | — |
 
 > **Prerequisites on the VM (one-time):**
 > 1. The managed identity **Abyss-04** must be **assigned to the VM** (VM → Identity → User assigned).
@@ -54,7 +55,7 @@ pip install -r requirements.txt
 
 # 3. configure
 cp .env.example .env
-nano .env      # set SERVICE_ENDPOINT and the COL_* names; MI details are pre-filled
+nano .env      # set SERVICE_FUNCTIONS_KEY (secret); columns, endpoints & MI are pre-filled
 
 # 4. run
 python main.py --limit 3      # test on 3 rows first
@@ -75,7 +76,7 @@ pip install -r requirements.txt
 
 # 3. configure
 Copy-Item .env.example .env
-notepad .env   # set SERVICE_ENDPOINT and the COL_* names; MI details are pre-filled
+notepad .env   # set SERVICE_FUNCTIONS_KEY (secret); columns, endpoints & MI are pre-filled
 
 # 4. run
 python main.py --limit 3      # test on 3 rows first
@@ -94,24 +95,27 @@ az storage blob list --account-name <acct> --container-name <container> \
 az login --identity --username 9e11a244-d9b5-44a3-8234-07d2141b3f69
 ```
 
-## Expected Excel format
+## Input file (CSV or Excel)
 
-Three columns (names are configurable in `.env` via `COL_*`):
+`INPUT_FILE` in `.env` points to a `.csv` or `.xlsx`. A ready-to-use **input_sample.csv**
+(10 rows) ships with the repo. Expected columns (configurable via `COL_*`):
 
-| storage_name | container | full_path |
+| Source | Container | FullPath |
 |---|---|---|
-| mystorageacct | invoices | mystorageacct/invoices/2026/07/file1.pdf |
-| mystorageacct | invoices | https://mystorageacct.blob.core.windows.net/invoices/2026/07/file2.pdf |
+| devssecontentstore | abc | /devssecontentstore/abc/Metadata.png |
+| devssecontentstore | afd-test | /devssecontentstore/afd-test/GA_Taxdue - tpr.pdf |
 
-The tool automatically derives the blob name (everything after the container), so both a
-plain path and a full `https://...` URL work.
+(The real export also has a `SizeBytes` column, which the tool ignores.)
+
+The tool automatically derives the blob name (everything after the container), so a
+leading-slash path like `/Source/Container/folder/file.pdf` and a full `https://...` URL both work.
 
 ## Run options
 
 ```bash
-python main.py                 # process everything in input.xlsx
+python main.py                 # process everything in input_sample.csv
 python main.py --limit 3       # test on the first 3 rows first
-python main.py --input other.xlsx --output result.xlsx
+python main.py --input other.csv --output result.xlsx
 ```
 
 ## Output
@@ -119,7 +123,25 @@ python main.py --input other.xlsx --output result.xlsx
 - **output.xlsx** — one row per file: `status`, `text_chars`, `error`, and the service response (as JSON text).
 - **responses/rowNNNN.json** — the full response for each file, ready to share.
 
-## Customize the service payload
+## The downstream call (GuardPII recognize)
 
-The downstream call is in [`call_service`](main.py). Edit the `payload` dict to match what
-your endpoint expects (it currently sends `{ "file": <blob name>, "content": <extracted text> }`).
+The call is in [`call_recognize`](main.py). For each file it sends:
+
+```json
+{ "texts": ["<extracted text>"], "detection_model": "llm" }
+```
+
+with headers `x-functions-key` (from `.env`) and a **fresh `x-operation-id` GUID per request**.
+
+> ⚠️ Reusing an `x-operation-id` makes the service return **HTTP 500**
+> (`'NoneType' object has no attribute 'set_supportive_context_word'`). The tool generates a
+> new GUID for every call, so this is handled automatically.
+
+The response is a JSON array of detected PII (e.g. `PERSON`, `FIRST_NAME`, `US_SSN`) and is saved
+to `responses/rowNNNN.json`:
+
+```json
+[{ "PERSON": { "Hardik": "Ashley" }, "US_SSN": { "123-00-3224": "375-96-0000" } }]
+```
+
+Change the model via `DETECTION_MODEL` in `.env`.

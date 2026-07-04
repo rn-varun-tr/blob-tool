@@ -5,7 +5,7 @@ For each row in an Excel file this tool:
   1. Reads: storage account name, container name, and the full blob path.
   2. Downloads the blob from Azure Storage (auth via `az login` / DefaultAzureCredential).
   3. Sends the file bytes to a Tika server to extract the text.
-  4. POSTs the extracted text as JSON to your downstream service.
+  4. POSTs the extracted text to the GuardPII 'recognize' endpoint for PII detection.
   5. Saves a summary Excel + one JSON file per row (the full response, ready to share).
 
 Authentication
@@ -26,6 +26,7 @@ import logging
 import mimetypes
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -51,7 +52,7 @@ log = logging.getLogger("ocr-tool")
 # --------------------------------------------------------------------------- #
 @dataclass
 class Config:
-    input_excel: str
+    input_file: str
     output_excel: str
     sheet_name: Optional[str]
     col_storage: str
@@ -59,22 +60,27 @@ class Config:
     col_fullpath: str
     tika_endpoint: str
     service_endpoint: str
-    service_api_key: Optional[str]
+    service_functions_key: Optional[str]
+    detection_model: str
     output_dir: str = "responses"
 
     @classmethod
     def from_env(cls) -> "Config":
         load_dotenv()
         return cls(
-            input_excel=os.getenv("INPUT_EXCEL", "input.xlsx"),
+            input_file=os.getenv("INPUT_FILE", os.getenv("INPUT_EXCEL", "input_sample.csv")),
             output_excel=os.getenv("OUTPUT_EXCEL", "output.xlsx"),
             sheet_name=os.getenv("SHEET_NAME") or None,
-            col_storage=os.getenv("COL_STORAGE", "storage_name"),
-            col_container=os.getenv("COL_CONTAINER", "container"),
-            col_fullpath=os.getenv("COL_FULLPATH", "full_path"),
+            col_storage=os.getenv("COL_STORAGE", "Source"),
+            col_container=os.getenv("COL_CONTAINER", "Container"),
+            col_fullpath=os.getenv("COL_FULLPATH", "FullPath"),
             tika_endpoint=os.getenv("TIKA_ENDPOINT", "https://tr-tika.safesendwebsites.com/tika").strip(),
-            service_endpoint=os.getenv("SERVICE_ENDPOINT", "").strip(),
-            service_api_key=os.getenv("SERVICE_API_KEY") or None,
+            service_endpoint=os.getenv(
+                "SERVICE_ENDPOINT",
+                "https://tr-orion-dev-guardpii.safesendwebsites.com/api/recognize",
+            ).strip(),
+            service_functions_key=os.getenv("SERVICE_FUNCTIONS_KEY") or None,
+            detection_model=os.getenv("DETECTION_MODEL", "llm").strip(),
         )
 
 
@@ -189,60 +195,54 @@ def download_blob(storage_name: str, container: str, blob_name: str) -> bytes:
     return with_retry(lambda: client.download_blob().readall())
 
 
-def _text_from_tika_json(data) -> str:
-    """Pull the extracted text out of a Tika JSON response (handles a few shapes)."""
-    if isinstance(data, str):
-        return data
-    if isinstance(data, list):  # /rmeta-style: a list of metadata dicts
-        return "\n".join(_text_from_tika_json(d) for d in data)
-    if isinstance(data, dict):
-        for key in ("X-TIKA:content", "content", "text"):
-            if data.get(key):
-                return str(data[key])
-        return json.dumps(data, ensure_ascii=False)
-    return str(data)
-
-
 def run_tika(cfg: Config, file_bytes: bytes, blob_name: str) -> str:
     """
-    Send the file bytes to the Tika server and return the extracted text.
+    Send the file bytes to the Tika server and return the extracted plain text.
 
     Mirrors:
-      curl -X PUT '<TIKA_ENDPOINT>' -H 'Accept: application/json' \\
+      curl -X PUT '<TIKA_ENDPOINT>' -H 'Accept: text/plain' \\
            -H 'Content-Type: application/pdf' --data-binary '@file.pdf'
 
-    The Content-Type is guessed from the file extension so non-PDF files work too.
+    We request `text/plain` so Tika returns clean text -- the JSON variant wraps the
+    text in HTML markup. The Content-Type is guessed from the file extension so
+    non-PDF files work too.
     """
     content_type, _ = mimetypes.guess_type(blob_name)
     headers = {
-        "Accept": "application/json",
+        "Accept": "text/plain",
         "Content-Type": content_type or "application/pdf",
     }
 
     def _put():
         resp = requests.put(cfg.tika_endpoint, data=file_bytes, headers=headers, timeout=180)
         resp.raise_for_status()
-        # Depending on the server, /tika returns plain text or JSON.
-        if "json" in resp.headers.get("Content-Type", "").lower():
-            return _text_from_tika_json(resp.json())
-        return resp.text
+        return resp.text.strip()
 
     return with_retry(_put)
 
 
-def call_service(cfg: Config, text: str, meta: dict) -> dict:
+def call_recognize(cfg: Config, text: str):
     """
-    POST the extracted text to your downstream service as JSON.
+    POST the extracted text to the GuardPII 'recognize' endpoint and return its JSON.
 
-    >>> Customize the `payload` below to match what your service expects. <<<
+    Mirrors:
+      curl '<SERVICE_ENDPOINT>' -H 'Content-Type: application/json' \\
+           -H 'x-functions-key: <key>' -H 'x-operation-id: <fresh-guid>' \\
+           --data '{ "texts": ["..."], "detection_model": "llm" }'
+
+    IMPORTANT: x-operation-id must be UNIQUE per request -- reusing one makes the
+    service return HTTP 500. We generate a fresh UUID for every call.
     """
-    headers = {"Content-Type": "application/json"}
-    if cfg.service_api_key:
-        headers["Authorization"] = f"Bearer {cfg.service_api_key}"
+    headers = {
+        "Content-Type": "application/json",
+        "x-operation-id": str(uuid.uuid4()),
+    }
+    if cfg.service_functions_key:
+        headers["x-functions-key"] = cfg.service_functions_key
 
     payload = {
-        "file": meta.get("blob_name"),
-        "content": text,
+        "texts": [text],
+        "detection_model": cfg.detection_model,
     }
 
     def _post():
@@ -257,18 +257,28 @@ def call_service(cfg: Config, text: str, meta: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Input reading
+# --------------------------------------------------------------------------- #
+def read_input_table(path: str, sheet_name: Optional[str]) -> pd.DataFrame:
+    """Read the input list from CSV or Excel, chosen by the file extension."""
+    if path.lower().endswith(".csv"):
+        return pd.read_csv(path, dtype=str, keep_default_na=False)
+    return pd.read_excel(path, sheet_name=sheet_name or 0, dtype=str)
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Batch OCR + downstream service caller")
-    parser.add_argument("--input", help="Input Excel path (overrides .env)")
+    parser = argparse.ArgumentParser(description="Batch Tika text extraction + GuardPII recognize")
+    parser.add_argument("--input", help="Input file path, CSV or Excel (overrides .env)")
     parser.add_argument("--output", help="Output Excel path (overrides .env)")
     parser.add_argument("--limit", type=int, default=0, help="Only process the first N rows (0 = all)")
     args = parser.parse_args()
 
     cfg = Config.from_env()
     if args.input:
-        cfg.input_excel = args.input
+        cfg.input_file = args.input
     if args.output:
         cfg.output_excel = args.output
 
@@ -276,11 +286,13 @@ def main() -> None:
         raise SystemExit("TIKA_ENDPOINT is not set. Copy .env.example to .env and fill it in.")
     if not cfg.service_endpoint:
         raise SystemExit("SERVICE_ENDPOINT is not set. Copy .env.example to .env and fill it in.")
+    if not cfg.service_functions_key:
+        raise SystemExit("SERVICE_FUNCTIONS_KEY is not set. Add the x-functions-key to your .env.")
 
     Path(cfg.output_dir).mkdir(exist_ok=True)
 
-    log.info("Reading %s", cfg.input_excel)
-    df = pd.read_excel(cfg.input_excel, sheet_name=cfg.sheet_name or 0)
+    log.info("Reading %s", cfg.input_file)
+    df = read_input_table(cfg.input_file, cfg.sheet_name)
     for col in (cfg.col_storage, cfg.col_container, cfg.col_fullpath):
         if col not in df.columns:
             raise SystemExit(
@@ -314,7 +326,7 @@ def main() -> None:
             text = run_tika(cfg, data, blob_name)
             rec["text_chars"] = len(text)
 
-            response = call_service(cfg, text, rec)
+            response = call_recognize(cfg, text)
             rec["service_response"] = response
 
             # Persist the full response so it can be shared.
