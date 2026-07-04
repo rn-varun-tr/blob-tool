@@ -65,6 +65,7 @@ class Config:
     detection_model: str
     output_dir: str = "response"
     allowed_extensions: tuple = ("png", "pdf")
+    process_extensionless: bool = True
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -89,6 +90,8 @@ class Config:
                 for e in os.getenv("ALLOWED_EXTENSIONS", "png,pdf").split(",")
                 if e.strip()
             ),
+            process_extensionless=os.getenv("PROCESS_EXTENSIONLESS", "true").strip().lower()
+            in ("1", "true", "yes", "y"),
         )
 
 
@@ -232,13 +235,14 @@ def run_tika(cfg: Config, file_bytes: bytes, blob_name: str) -> str:
            -H 'Content-Type: application/pdf' --data-binary '@file.pdf'
 
     We request `text/plain` so Tika returns clean text -- the JSON variant wraps the
-    text in HTML markup. The Content-Type is guessed from the file extension so
-    non-PDF files work too.
+    text in HTML markup. The Content-Type is guessed from the file extension; when it
+    can't be guessed (e.g. an extensionless blob) we send `application/octet-stream`
+    so Tika auto-detects the real type from the bytes.
     """
     content_type, _ = mimetypes.guess_type(blob_name)
     headers = {
         "Accept": "text/plain",
-        "Content-Type": content_type or "application/pdf",
+        "Content-Type": content_type or "application/octet-stream",
     }
 
     def _put():
@@ -354,12 +358,24 @@ def main() -> None:
         }
         log.info("[%d] %s / %s / %s", rec["row"], storage, container, blob_name)
 
-        # Only process the allowed file types (e.g. png, pdf). Skip the rest
-        # (.msi, .zip, extensionless blobs, ...) -- Tika can't OCR those anyway.
+        # Decide whether to process this blob based on its extension:
+        #   * allowed extensions (e.g. png, pdf) -> process
+        #   * no extension -> try it too (often just a missing extension); Tika
+        #     auto-detects the real type, and if it can't parse it we skip on the
+        #     error handler below and move on
+        #   * anything else (.msi, .zip, ...) -> skip
         ext = os.path.splitext(blob_name)[1].lstrip(".").lower()
-        if cfg.allowed_extensions and ext not in cfg.allowed_extensions:
+        if not ext:
+            if not cfg.process_extensionless:
+                rec["status"] = "skipped"
+                rec["error"] = "extensionless blob (PROCESS_EXTENSIONLESS is off)"
+                log.info("[%d] skipped (%s)", rec["row"], rec["error"])
+                results.append(rec)
+                continue
+            log.info("[%d] extensionless -- trying Tika auto-detect", rec["row"])
+        elif cfg.allowed_extensions and ext not in cfg.allowed_extensions:
             rec["status"] = "skipped"
-            rec["error"] = f"extension '{ext or '(none)'}' not in {list(cfg.allowed_extensions)}"
+            rec["error"] = f"extension '{ext}' not in {list(cfg.allowed_extensions)}"
             log.info("[%d] skipped (%s)", rec["row"], rec["error"])
             results.append(rec)
             continue
