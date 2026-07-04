@@ -112,6 +112,10 @@ az login --identity --username 9e11a244-d9b5-44a3-8234-07d2141b3f69
 columns are used only as a fallback. A leading-slash path like `/Source/Container/folder/file.pdf`
 and a full `https://...` URL both work.
 
+**Only `png` and `pdf` blobs are processed** by default — other types (`.msi`, `.zip`, extensionless,
+…) are skipped and marked `skipped` in the summary. Change this with `ALLOWED_EXTENSIONS` in `.env`
+(comma-separated, e.g. `ALLOWED_EXTENSIONS=png,pdf,tiff`).
+
 ## Run options
 
 ```bash

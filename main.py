@@ -64,6 +64,7 @@ class Config:
     service_functions_key: Optional[str]
     detection_model: str
     output_dir: str = "response"
+    allowed_extensions: tuple = ("png", "pdf")
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -83,6 +84,11 @@ class Config:
             service_functions_key=os.getenv("SERVICE_FUNCTIONS_KEY") or None,
             detection_model=os.getenv("DETECTION_MODEL", "llm").strip(),
             output_dir=os.getenv("OUTPUT_DIR", "response"),
+            allowed_extensions=tuple(
+                e.strip().lstrip(".").lower()
+                for e in os.getenv("ALLOWED_EXTENSIONS", "png,pdf").split(",")
+                if e.strip()
+            ),
         )
 
 
@@ -348,6 +354,16 @@ def main() -> None:
         }
         log.info("[%d] %s / %s / %s", rec["row"], storage, container, blob_name)
 
+        # Only process the allowed file types (e.g. png, pdf). Skip the rest
+        # (.msi, .zip, extensionless blobs, ...) -- Tika can't OCR those anyway.
+        ext = os.path.splitext(blob_name)[1].lstrip(".").lower()
+        if cfg.allowed_extensions and ext not in cfg.allowed_extensions:
+            rec["status"] = "skipped"
+            rec["error"] = f"extension '{ext or '(none)'}' not in {list(cfg.allowed_extensions)}"
+            log.info("[%d] skipped (%s)", rec["row"], rec["error"])
+            results.append(rec)
+            continue
+
         try:
             data = download_blob(storage, container, blob_name)
             text = run_tika(cfg, data, blob_name)
@@ -377,7 +393,13 @@ def main() -> None:
             lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v
         )
     summary.to_excel(cfg.output_excel, index=False)
-    log.info("Done. Summary -> %s | Per-blob responses -> %s/", cfg.output_excel, cfg.output_dir)
+    n_ok = sum(1 for r in results if r["status"] == "ok")
+    n_skipped = sum(1 for r in results if r["status"] == "skipped")
+    n_error = sum(1 for r in results if r["status"] == "error")
+    log.info(
+        "Done. processed=%d skipped=%d error=%d | Summary -> %s | Per-blob responses -> %s/",
+        n_ok, n_skipped, n_error, cfg.output_excel, cfg.output_dir,
+    )
 
 
 if __name__ == "__main__":
