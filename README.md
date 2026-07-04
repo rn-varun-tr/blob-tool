@@ -6,7 +6,7 @@ Small Python tool that, for each row in an Excel file:
 2. Downloads the blob from **Azure Storage**.
 3. Sends the file to a **Tika server** (`PUT /tika`, `Accept: text/plain`) to extract text.
 4. **POSTs** the extracted text to the **GuardPII `recognize`** endpoint for PII detection.
-5. Saves a summary Excel + one JSON file per row under `responses/`.
+5. Saves each response as `response/<blob-name>.json`, plus a summary Excel.
 
 ## Authentication (important)
 
@@ -107,8 +107,10 @@ az login --identity --username 9e11a244-d9b5-44a3-8234-07d2141b3f69
 
 (The real export also has a `SizeBytes` column, which the tool ignores.)
 
-The tool automatically derives the blob name (everything after the container), so a
-leading-slash path like `/Source/Container/folder/file.pdf` and a full `https://...` URL both work.
+**Storage, container and blob name are all parsed from `FullPath`** by splitting on `/`
+(1st segment = storage account, 2nd = container, the rest = blob path). The `Source`/`Container`
+columns are used only as a fallback. A leading-slash path like `/Source/Container/folder/file.pdf`
+and a full `https://...` URL both work.
 
 ## Run options
 
@@ -120,8 +122,10 @@ python main.py --input other.csv --output result.xlsx
 
 ## Output
 
-- **output.xlsx** — one row per file: `status`, `text_chars`, `error`, and the service response (as JSON text).
-- **responses/rowNNNN.json** — the full response for each file, ready to share.
+- **response/&lt;blob-name&gt;.json** — the recognize response for each file, named after the blob
+  (folders in the blob path are flattened with `_`, e.g. `copy/Metadata.png` → `copy_Metadata.json`).
+  This is the main output.
+- **output.xlsx** — a summary: one row per file with `status`, `text_chars`, `output_json`, `error`.
 
 ## The downstream call (GuardPII recognize)
 
@@ -138,7 +142,7 @@ with headers `x-functions-key` (from `.env`) and a **fresh `x-operation-id` GUID
 > new GUID for every call, so this is handled automatically.
 
 The response is a JSON array of detected PII (e.g. `PERSON`, `FIRST_NAME`, `US_SSN`) and is saved
-to `responses/rowNNNN.json`:
+to `response/<blob-name>.json`:
 
 ```json
 [{ "PERSON": { "Hardik": "Ashley" }, "US_SSN": { "123-00-3224": "375-96-0000" } }]

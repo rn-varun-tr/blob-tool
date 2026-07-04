@@ -1,5 +1,5 @@
 .env
-responses/
+response/
 output.xlsx
 __pycache__/
 *.pyc

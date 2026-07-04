@@ -25,6 +25,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -62,7 +63,7 @@ class Config:
     service_endpoint: str
     service_functions_key: Optional[str]
     detection_model: str
-    output_dir: str = "responses"
+    output_dir: str = "response"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -81,6 +82,7 @@ class Config:
             ).strip(),
             service_functions_key=os.getenv("SERVICE_FUNCTIONS_KEY") or None,
             detection_model=os.getenv("DETECTION_MODEL", "llm").strip(),
+            output_dir=os.getenv("OUTPUT_DIR", "response"),
         )
 
 
@@ -162,32 +164,52 @@ def blob_service(storage_name: str) -> BlobServiceClient:
 # --------------------------------------------------------------------------- #
 # Core steps
 # --------------------------------------------------------------------------- #
-def extract_blob_name(full_path: str, storage_name: str, container: str) -> str:
+def parse_full_path(full_path: str, fallback_storage: str = "", fallback_container: str = ""):
     """
-    Turn the 'full path' cell into the blob name (everything after the container).
+    Parse a FullPath value into (storage_account, container, blob_name).
 
-    Handles values such as:
-      * storageacct/mycontainer/folder/file.pdf
-      * mycontainer/folder/file.pdf
-      * https://storageacct.blob.core.windows.net/mycontainer/folder/file.pdf
+    The path is split on '/': the 1st segment is the storage account, the 2nd is
+    the container, and everything after is the blob name (the file path inside the
+    container). URL-form paths are supported too. The column values are used only
+    as a fallback when the path itself doesn't carry enough segments.
+
+    Examples:
+      /devssecontentstore/abc/copy/Metadata.png
+          -> ("devssecontentstore", "abc", "copy/Metadata.png")
+      devssecontentstore/abc/file.pdf
+          -> ("devssecontentstore", "abc", "file.pdf")
+      https://devssecontentstore.blob.core.windows.net/abc/file.pdf
+          -> ("devssecontentstore", "abc", "file.pdf")
     """
     p = str(full_path).strip().replace("\\", "/")
+
+    # URL form: the storage account lives in the host name.
     if "://" in p:
-        p = p.split("://", 1)[1]          # drop the https:// scheme
-    p = p.lstrip("/")
+        host, _, rest = p.split("://", 1)[1].partition("/")
+        storage = host.split(".", 1)[0] or fallback_storage
+        segments = [s for s in rest.split("/") if s]
+        container = segments[0] if segments else fallback_container
+        return storage, container, "/".join(segments[1:])
 
-    marker = f"{container}/"
-    idx = p.find(marker)
-    if idx != -1:
-        return p[idx + len(marker):]
+    segments = [s for s in p.split("/") if s]
+    if len(segments) >= 3:
+        return segments[0], segments[1], "/".join(segments[2:])
+    if len(segments) == 2:                       # no storage in the path
+        return fallback_storage, segments[0], segments[1]
+    return fallback_storage, fallback_container, segments[0] if segments else ""
 
-    # Fallback: assume "<storage>/<container>/<blob...>" or "<container>/<blob...>"
-    segments = p.split("/")
-    if segments and segments[0] == storage_name and len(segments) > 2:
-        return "/".join(segments[2:])
-    if len(segments) > 1:
-        return "/".join(segments[1:])
-    return p
+
+def blob_to_json_name(blob_name: str) -> str:
+    """
+    Build a safe .json filename from a blob name (same base name as the blob).
+
+    The blob's folder path is flattened so identically named files in different
+    folders don't overwrite each other (e.g. 'copy/Metadata.png' vs 'Metadata.png').
+    """
+    name = blob_name.strip("/")
+    stem, _ext = os.path.splitext(name)          # drop the original extension
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem or name)
+    return f"{stem or 'response'}.json"
 
 
 def download_blob(storage_name: str, container: str, blob_name: str) -> bytes:
@@ -293,22 +315,26 @@ def main() -> None:
 
     log.info("Reading %s", cfg.input_file)
     df = read_input_table(cfg.input_file, cfg.sheet_name)
-    for col in (cfg.col_storage, cfg.col_container, cfg.col_fullpath):
-        if col not in df.columns:
-            raise SystemExit(
-                f"Column '{col}' not found. Available columns: {list(df.columns)}. "
-                f"Adjust the COL_* values in .env."
-            )
+    if cfg.col_fullpath not in df.columns:
+        raise SystemExit(
+            f"Column '{cfg.col_fullpath}' not found. Available columns: {list(df.columns)}. "
+            f"Set COL_FULLPATH in .env. (Storage and container are parsed from this column; "
+            f"COL_STORAGE/COL_CONTAINER are optional fallbacks.)"
+        )
+    has_storage_col = cfg.col_storage in df.columns
+    has_container_col = cfg.col_container in df.columns
 
     if args.limit:
         df = df.head(args.limit)
 
     results: list[dict] = []
     for i, row in df.iterrows():
-        storage = str(row[cfg.col_storage]).strip()
-        container = str(row[cfg.col_container]).strip()
         full_path = str(row[cfg.col_fullpath]).strip()
-        blob_name = extract_blob_name(full_path, storage, container)
+        fb_storage = str(row[cfg.col_storage]).strip() if has_storage_col else ""
+        fb_container = str(row[cfg.col_container]).strip() if has_container_col else ""
+        # Storage, container and blob name are all taken from the FullPath column
+        # (with the storage/container columns as fallback).
+        storage, container, blob_name = parse_full_path(full_path, fb_storage, fb_container)
 
         rec: dict = {
             "row": int(i) + 1,
@@ -317,6 +343,7 @@ def main() -> None:
             "blob_name": blob_name,
             "status": "ok",
             "text_chars": 0,
+            "output_json": "",
             "error": "",
         }
         log.info("[%d] %s / %s / %s", rec["row"], storage, container, blob_name)
@@ -329,12 +356,13 @@ def main() -> None:
             response = call_recognize(cfg, text)
             rec["service_response"] = response
 
-            # Persist the full response so it can be shared.
-            out_json = Path(cfg.output_dir) / f"row{rec['row']:04d}.json"
+            # Save the recognize response as JSON, named after the blob.
+            out_json = Path(cfg.output_dir) / blob_to_json_name(blob_name)
             out_json.write_text(
-                json.dumps({"meta": rec, "response": response}, indent=2, ensure_ascii=False),
+                json.dumps(response, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
+            rec["output_json"] = str(out_json)
         except Exception as exc:  # keep going on a single-row failure
             rec["status"] = "error"
             rec["error"] = str(exc)
@@ -349,7 +377,7 @@ def main() -> None:
             lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v
         )
     summary.to_excel(cfg.output_excel, index=False)
-    log.info("Done. Summary -> %s | Full responses -> %s/", cfg.output_excel, cfg.output_dir)
+    log.info("Done. Summary -> %s | Per-blob responses -> %s/", cfg.output_excel, cfg.output_dir)
 
 
 if __name__ == "__main__":
