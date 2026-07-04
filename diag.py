@@ -146,8 +146,18 @@ def main() -> None:
                 "\n   Interpretation:\n"
                 "     * list steps 200 but GET 500 -> account is UP; only this blob/read path is\n"
                 "       broken (bad blob, archive tier, or a storage backend issue for this object).\n"
-                f"     * list steps ALSO fail       -> account '{account}' is unhealthy; share the\n"
-                "       x-ms-request-id above with the account owner / Azure support."
+                f"     * list steps ALSO fail       -> the whole blob endpoint of '{account}' is\n"
+                "       failing, even basic metadata ops. Auth works, so this is NOT the tool and\n"
+                "       NOT your identity. Most likely server-side causes to check with the owner:\n"
+                "         - Customer-Managed Key (CMK) is inaccessible: if the account is encrypted\n"
+                "           with a Key Vault key that's disabled/deleted/expired or the Key Vault\n"
+                "           firewall blocks Storage, EVERY data op returns 500. (Portal > the account\n"
+                "           > Encryption; and Key Vault > the key status/access.)\n"
+                "         - A backend/region incident: Portal > the account > Resource Health, and\n"
+                "           check Azure Service Health for the region.\n"
+                "         - Account in a bad/migrating state.\n"
+                "       Share ALL the x-ms-request-id values + timestamps above (and that even List\n"
+                "       Containers 500s, while another account works from this same VM)."
             )
         elif resp.status_code == 403:
             print(
