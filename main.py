@@ -26,8 +26,10 @@ import logging
 import mimetypes
 import os
 import re
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -70,6 +72,8 @@ class Config:
         "pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp", "heic", "heif",
     )
     process_extensionless: bool = False
+    max_workers: int = 5
+    resume: bool = True
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -99,6 +103,8 @@ class Config:
             ),
             process_extensionless=os.getenv("PROCESS_EXTENSIONLESS", "false").strip().lower()
             in ("1", "true", "yes", "y"),
+            max_workers=int(os.getenv("MAX_WORKERS", "5") or "5"),
+            resume=os.getenv("RESUME", "true").strip().lower() in ("1", "true", "yes", "y"),
         )
 
 
@@ -130,6 +136,7 @@ def with_retry(fn, *, attempts: int = 3, base_delay: float = 2.0):
 # --------------------------------------------------------------------------- #
 _credential = None
 _blob_clients: dict[str, BlobServiceClient] = {}
+_blob_clients_lock = threading.Lock()
 
 
 def build_credential():
@@ -203,49 +210,79 @@ def verify_auth() -> None:
 
 
 def blob_service(storage_name: str) -> BlobServiceClient:
-    """Return a cached BlobServiceClient for the given storage account."""
-    if storage_name not in _blob_clients:
-        url = f"https://{storage_name}.blob.core.windows.net"
-        _blob_clients[storage_name] = BlobServiceClient(account_url=url, credential=get_credential())
-    return _blob_clients[storage_name]
+    """Return a cached BlobServiceClient for the given storage account (thread-safe)."""
+    with _blob_clients_lock:
+        client = _blob_clients.get(storage_name)
+        if client is None:
+            url = f"https://{storage_name}.blob.core.windows.net"
+            client = BlobServiceClient(account_url=url, credential=get_credential())
+            _blob_clients[storage_name] = client
+        return client
 
 
 # --------------------------------------------------------------------------- #
 # Core steps
 # --------------------------------------------------------------------------- #
-def parse_full_path(full_path: str, fallback_storage: str = "", fallback_container: str = ""):
+def _accounts_match(segment: str, account: str) -> bool:
     """
-    Parse a FullPath value into (storage_account, container, blob_name).
+    True if a path segment names the given storage account.
 
-    The path is split on '/': the 1st segment is the storage account, the 2nd is
-    the container, and everything after is the blob name (the file path inside the
-    container). URL-form paths are supported too. The column values are used only
-    as a fallback when the path itself doesn't carry enough segments.
+    Tolerates a spurious leading 'o' seen in some FullPath values (e.g.
+    'oqassrcontentstore' where the real account is 'qassrcontentstore' -- the
+    'o'-prefixed name doesn't even resolve in DNS).
+    """
+    s, a = segment.strip().lower(), account.strip().lower()
+    if not a:
+        return False
+    return s == a or s == "o" + a or "o" + s == a
 
-    Examples:
-      /devssecontentstore/abc/copy/Metadata.png
-          -> ("devssecontentstore", "abc", "copy/Metadata.png")
-      devssecontentstore/abc/file.pdf
-          -> ("devssecontentstore", "abc", "file.pdf")
-      https://devssecontentstore.blob.core.windows.net/abc/file.pdf
-          -> ("devssecontentstore", "abc", "file.pdf")
+
+def parse_full_path(full_path: str, col_storage: str = "", col_container: str = ""):
+    """
+    Work out (storage_account, container, blob_name) for one row.
+
+    The Source/Container columns are AUTHORITATIVE for the storage account and
+    container: the FullPath's own first segment has proven unreliable (an extra
+    leading 'o' was seen, e.g. 'oqassrcontentstore' vs the real
+    'qassrcontentstore'). FullPath is used only to derive the blob name -- we strip
+    any leading storage-account and container segments (matched by NAME, tolerating
+    the 'o' quirk) and treat the rest as the blob path. When a column is missing we
+    fall back to the value parsed from the path itself.
+
+    Examples (with Source='qassrcontentstore', Container='documentation'):
+      /oqassrcontentstore/documentation/ssr/v1/Doc.pdf
+          -> ("qassrcontentstore", "documentation", "ssr/v1/Doc.pdf")
+      /qassrcontentstore/documentation/ssr/v1/Doc.pdf
+          -> ("qassrcontentstore", "documentation", "ssr/v1/Doc.pdf")
     """
     p = str(full_path).strip().replace("\\", "/")
 
-    # URL form: the storage account lives in the host name.
-    if "://" in p:
+    host_account = ""
+    if "://" in p:                       # URL form -> reduce to the path after the host
         host, _, rest = p.split("://", 1)[1].partition("/")
-        storage = host.split(".", 1)[0] or fallback_storage
-        segments = [s for s in rest.split("/") if s]
-        container = segments[0] if segments else fallback_container
-        return storage, container, "/".join(segments[1:])
+        host_account = host.split(".", 1)[0]
+        p = rest
 
     segments = [s for s in p.split("/") if s]
-    if len(segments) >= 3:
-        return segments[0], segments[1], "/".join(segments[2:])
-    if len(segments) == 2:                       # no storage in the path
-        return fallback_storage, segments[0], segments[1]
-    return fallback_storage, fallback_container, segments[0] if segments else ""
+
+    # Storage account: prefer the Source column, then the URL host, then the 1st
+    # path segment (only when the path clearly carries storage + container + blob).
+    positional_storage = segments[0] if len(segments) >= 3 else ""
+    storage = (col_storage or host_account or positional_storage).strip()
+
+    # Drop a leading storage-account segment if the path repeats it (handles the
+    # bogus 'o' prefix too) so it isn't mistaken for part of the blob name.
+    if segments and _accounts_match(segments[0], storage):
+        segments = segments[1:]
+
+    # Container: prefer the Container column, else the next path segment.
+    container = (col_container or (segments[0] if segments else "")).strip()
+
+    # Drop a leading container segment if the path repeats it.
+    if segments and container and segments[0].lower() == container.lower():
+        segments = segments[1:]
+
+    return storage, container, "/".join(segments)
 
 
 def blob_to_json_name(blob_name: str) -> str:
@@ -339,6 +376,70 @@ def read_input_table(path: str, sheet_name: Optional[str]) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# Per-blob worker (runs on a thread-pool thread)
+# --------------------------------------------------------------------------- #
+def process_one(cfg: Config, row_num: int, storage: str, container: str, blob_name: str) -> dict:
+    """
+    Handle a single blob end-to-end and return a result record.
+
+    Safe to run concurrently: it only touches per-call state plus the thread-safe
+    shared blob-client cache, and each row writes its own uniquely named JSON file.
+    Any failure is captured in the record (status='error') so one bad blob never
+    stops the batch.
+    """
+    rec: dict = {
+        "row": row_num,
+        "storage": storage,
+        "container": container,
+        "blob_name": blob_name,
+        "status": "ok",
+        "text_chars": 0,
+        "output_json": "",
+        "error": "",
+    }
+
+    # Extension gate: process allowed types (pdf/images); optionally try extensionless.
+    ext = os.path.splitext(blob_name)[1].lstrip(".").lower()
+    if not ext:
+        if not cfg.process_extensionless:
+            rec["status"] = "skipped"
+            rec["error"] = "extensionless blob (PROCESS_EXTENSIONLESS is off)"
+            return rec
+    elif cfg.allowed_extensions and ext not in cfg.allowed_extensions:
+        rec["status"] = "skipped"
+        rec["error"] = f"extension '{ext}' not in {list(cfg.allowed_extensions)}"
+        return rec
+
+    # Resume: if this blob's JSON already exists, don't redo it (lets you re-run a
+    # huge batch after a crash and only pick up what's left).
+    out_json = Path(cfg.output_dir) / blob_to_json_name(blob_name)
+    if cfg.resume and out_json.exists():
+        rec["status"] = "exists"
+        rec["output_json"] = str(out_json)
+        return rec
+
+    try:
+        data = download_blob(storage, container, blob_name)
+        text = run_tika(cfg, data, blob_name)
+        rec["text_chars"] = len(text)
+
+        response = call_recognize(cfg, text)
+        rec["service_response"] = response
+
+        out_json.write_text(
+            json.dumps(response, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        rec["output_json"] = str(out_json)
+    except Exception as exc:  # keep going on a single-row failure
+        rec["status"] = "error"
+        rec["error"] = str(exc)
+        log.error("[row %d] failed: %s", row_num, exc)
+
+    return rec
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main() -> None:
@@ -346,6 +447,16 @@ def main() -> None:
     parser.add_argument("--input", help="Input file path, CSV or Excel (overrides .env)")
     parser.add_argument("--output", help="Output Excel path (overrides .env)")
     parser.add_argument("--limit", type=int, default=0, help="Only process the first N rows (0 = all)")
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="How many blobs to process in parallel (0 = use MAX_WORKERS from .env, default 5)",
+    )
+    parser.add_argument(
+        "--process-extensionless", dest="process_extensionless",
+        action="store_true", default=None,
+        help="Also process blobs with NO extension (Tika auto-detects the real type). "
+             "Overrides PROCESS_EXTENSIONLESS from .env for this run.",
+    )
     args = parser.parse_args()
 
     cfg = Config.from_env()
@@ -353,6 +464,11 @@ def main() -> None:
         cfg.input_file = args.input
     if args.output:
         cfg.output_excel = args.output
+    if args.workers:
+        cfg.max_workers = args.workers
+    cfg.max_workers = max(1, cfg.max_workers)
+    if args.process_extensionless is not None:
+        cfg.process_extensionless = args.process_extensionless
 
     if not cfg.tika_endpoint:
         raise SystemExit("TIKA_ENDPOINT is not set. Copy .env.example to .env and fill it in.")
@@ -379,70 +495,46 @@ def main() -> None:
     if args.limit:
         df = df.head(args.limit)
 
-    results: list[dict] = []
+    # Build the work list first (storage/container from the authoritative columns;
+    # blob name from FullPath).
+    tasks: list[tuple] = []
     for i, row in df.iterrows():
         full_path = str(row[cfg.col_fullpath]).strip()
         fb_storage = str(row[cfg.col_storage]).strip() if has_storage_col else ""
         fb_container = str(row[cfg.col_container]).strip() if has_container_col else ""
-        # Storage, container and blob name are all taken from the FullPath column
-        # (with the storage/container columns as fallback).
         storage, container, blob_name = parse_full_path(full_path, fb_storage, fb_container)
+        tasks.append((int(i) + 1, storage, container, blob_name))
 
-        rec: dict = {
-            "row": int(i) + 1,
-            "storage": storage,
-            "container": container,
-            "blob_name": blob_name,
-            "status": "ok",
-            "text_chars": 0,
-            "output_json": "",
-            "error": "",
+    total = len(tasks)
+    log.info("Processing %d row(s) with %d parallel worker(s)...", total, cfg.max_workers)
+
+    # Fan out across a small thread pool. The steps are all network I/O (blob
+    # download, Tika, recognize), so threads give real speed-up despite the GIL.
+    results: list[dict] = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=cfg.max_workers) as pool:
+        futures = {
+            pool.submit(process_one, cfg, row_num, storage, container, blob_name): row_num
+            for (row_num, storage, container, blob_name) in tasks
         }
-        log.info("[%d] %s / %s / %s", rec["row"], storage, container, blob_name)
-
-        # Decide whether to process this blob based on its extension:
-        #   * allowed extensions (e.g. png, pdf) -> process
-        #   * no extension -> try it too (often just a missing extension); Tika
-        #     auto-detects the real type, and if it can't parse it we skip on the
-        #     error handler below and move on
-        #   * anything else (.msi, .zip, ...) -> skip
-        ext = os.path.splitext(blob_name)[1].lstrip(".").lower()
-        if not ext:
-            if not cfg.process_extensionless:
-                rec["status"] = "skipped"
-                rec["error"] = "extensionless blob (PROCESS_EXTENSIONLESS is off)"
-                log.info("[%d] skipped (%s)", rec["row"], rec["error"])
-                results.append(rec)
-                continue
-            log.info("[%d] extensionless -- trying Tika auto-detect", rec["row"])
-        elif cfg.allowed_extensions and ext not in cfg.allowed_extensions:
-            rec["status"] = "skipped"
-            rec["error"] = f"extension '{ext}' not in {list(cfg.allowed_extensions)}"
-            log.info("[%d] skipped (%s)", rec["row"], rec["error"])
+        for fut in as_completed(futures):
+            rec = fut.result()
             results.append(rec)
-            continue
+            done += 1
+            status, blob = rec["status"], rec["blob_name"]
+            if status == "ok":
+                log.info("[%d/%d] ok: %s (%d chars) -> %s",
+                         done, total, blob, rec["text_chars"], rec["output_json"])
+            elif status == "exists":
+                log.info("[%d/%d] already done, skipping: %s", done, total, blob)
+            elif status == "skipped":
+                log.info("[%d/%d] skipped (%s): %s", done, total, rec["error"], blob)
+            else:
+                log.info("[%d/%d] ERROR: %s (%s)", done, total, blob, rec["error"])
 
-        try:
-            data = download_blob(storage, container, blob_name)
-            text = run_tika(cfg, data, blob_name)
-            rec["text_chars"] = len(text)
-
-            response = call_recognize(cfg, text)
-            rec["service_response"] = response
-
-            # Save the recognize response as JSON, named after the blob.
-            out_json = Path(cfg.output_dir) / blob_to_json_name(blob_name)
-            out_json.write_text(
-                json.dumps(response, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            rec["output_json"] = str(out_json)
-        except Exception as exc:  # keep going on a single-row failure
-            rec["status"] = "error"
-            rec["error"] = str(exc)
-            log.error("[%d] failed: %s", rec["row"], exc)
-
-        results.append(rec)
+    # Keep the output readable: sort back into input row order (the pool finishes
+    # out of order).
+    results.sort(key=lambda r: r["row"])
 
     # Write a readable summary Excel (nested JSON flattened to a string).
     summary = pd.DataFrame(results)
@@ -452,11 +544,12 @@ def main() -> None:
         )
     summary.to_excel(cfg.output_excel, index=False)
     n_ok = sum(1 for r in results if r["status"] == "ok")
+    n_exists = sum(1 for r in results if r["status"] == "exists")
     n_skipped = sum(1 for r in results if r["status"] == "skipped")
     n_error = sum(1 for r in results if r["status"] == "error")
     log.info(
-        "Done. processed=%d skipped=%d error=%d | Summary -> %s | Per-blob responses -> %s/",
-        n_ok, n_skipped, n_error, cfg.output_excel, cfg.output_dir,
+        "Done. ok=%d already_done=%d skipped=%d error=%d | Summary -> %s | Per-blob responses -> %s/",
+        n_ok, n_exists, n_skipped, n_error, cfg.output_excel, cfg.output_dir,
     )
 
 
